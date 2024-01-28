@@ -12,6 +12,8 @@
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
 #include <linux/swap.h>
+#include <linux/memory-tiers.h>
+#include <linux/migrate.h>
 
 #include "../internal.h"
 #include "ops-common.h"
@@ -225,6 +227,245 @@ static bool damos_pa_filter_out(struct damos *scheme, struct folio *folio)
 	return false;
 }
 
+#if 1
+static struct folio *alloc_demote_folio(struct folio *src,
+		unsigned long private)
+{
+	struct folio *dst;
+	nodemask_t *allowed_mask;
+	struct migration_target_control *mtc;
+
+	mtc = (struct migration_target_control *)private;
+
+	allowed_mask = mtc->nmask;
+	/*
+	 * make sure we allocate from the target node first also trying to
+	 * demote or reclaim pages from the target node via kswapd if we are
+	 * low on free memory on target node. If we don't do this and if
+	 * we have free memory on the slower(lower) memtier, we would start
+	 * allocating pages from slower(lower) memory tiers without even forcing
+	 * a demotion of cold pages from the target memtier. This can result
+	 * in the kernel placing hot pages in slower(lower) memory tiers.
+	 */
+	mtc->nmask = NULL;
+	mtc->gfp_mask |= __GFP_THISNODE;
+	dst = alloc_migration_target(src, (unsigned long)mtc);
+	if (dst)
+		return dst;
+
+	mtc->gfp_mask &= ~__GFP_THISNODE;
+	mtc->nmask = allowed_mask;
+
+	return alloc_migration_target(src, (unsigned long)mtc);
+}
+
+/*
+ * Take folios on @demote_folios and attempt to demote them to another node.
+ * Folios which are not demoted are left on @demote_folios.
+ */
+static unsigned int demote_folio_list(struct list_head *demote_folios,
+				     struct pglist_data *pgdat)
+{
+	int target_nid = next_demotion_node(pgdat->node_id);
+	unsigned int nr_succeeded;
+	nodemask_t allowed_mask;
+
+	struct migration_target_control mtc = {
+		/*
+		 * Allocate from 'node', or fail quickly and quietly.
+		 * When this happens, 'page' will likely just be discarded
+		 * instead of migrated.
+		 */
+		.gfp_mask = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) | __GFP_NOWARN |
+			__GFP_NOMEMALLOC | GFP_NOWAIT,
+		.nid = target_nid,
+		.nmask = &allowed_mask
+	};
+
+	if (list_empty(demote_folios))
+		return 0;
+
+	if (target_nid == NUMA_NO_NODE)
+		return 0;
+
+	node_get_allowed_targets(pgdat, &allowed_mask);
+
+	/* Demotion ignores all cpuset and mempolicy settings */
+	migrate_pages(demote_folios, alloc_demote_folio, NULL,
+		      (unsigned long)&mtc, MIGRATE_ASYNC, MR_DEMOTION,
+		      &nr_succeeded);
+
+	__count_vm_events(PGDEMOTE_DIRECT, nr_succeeded);
+
+	return nr_succeeded;
+}
+
+/*
+ * __demote_folio_list() returns the number of demoted pages
+ */
+static unsigned int __demote_folio_list(struct list_head *folio_list,
+//		struct pglist_data *pgdat, struct scan_control *sc)
+		struct pglist_data *pgdat)
+{
+	LIST_HEAD(ret_folios);
+	LIST_HEAD(demote_folios);
+	unsigned int nr_demoted = 0;
+
+	if (next_demotion_node(pgdat->node_id) == NUMA_NO_NODE)
+		return 0;
+
+	cond_resched();
+
+	while (!list_empty(folio_list)) {
+		struct folio *folio;
+//		enum folio_references references;
+
+		cond_resched();
+
+		folio = lru_to_folio(folio_list);
+		list_del(&folio->lru);
+
+		if (!folio_trylock(folio))
+			goto keep;
+
+		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
+#if 0
+		references = folio_check_references(folio, sc);
+		if (references == FOLIOREF_KEEP)
+			goto keep_locked;
+#endif
+		/* Relocate its contents to another node. */
+		list_add(&folio->lru, &demote_folios);
+		folio_unlock(folio);
+		continue;
+//keep_locked:
+//		folio_unlock(folio);
+keep:
+		list_add(&folio->lru, &ret_folios);
+		VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+	}
+	/* 'folio_list' is always empty here */
+
+	/* Migrate folios selected for demotion */
+	nr_demoted += demote_folio_list(&demote_folios, pgdat);
+	/* Folios that could not be demoted are still in @demote_folios */
+	if (!list_empty(&demote_folios)) {
+		/* Folios which weren't demoted go back on @folio_list */
+		list_splice_init(&demote_folios, folio_list);
+	}
+
+	try_to_unmap_flush();
+
+	list_splice(&ret_folios, folio_list);
+
+	return nr_demoted;
+}
+
+#if 0
+static unsigned int reclaim_folio_list(struct list_head *folio_list,
+				      struct pglist_data *pgdat)
+#else
+static unsigned int demote_folio_list2(struct list_head *folio_list,
+				      struct pglist_data *pgdat)
+#endif
+{
+	unsigned int nr_demoted;
+	struct folio *folio;
+#if 0
+	struct scan_control sc = {
+		.gfp_mask = GFP_KERNEL,
+	};
+#endif
+
+#if 0
+	nr_demoted = shrink_folio_list(folio_list, pgdat, &sc, &dummy_stat, false);
+#else
+	//nr_demoted = __demote_folio_list(folio_list, pgdat, &sc);
+	nr_demoted = __demote_folio_list(folio_list, pgdat);
+#endif
+	while (!list_empty(folio_list)) {
+		folio = lru_to_folio(folio_list);
+		list_del(&folio->lru);
+		folio_putback_lru(folio);
+	}
+
+	return nr_demoted;
+}
+
+#if 0
+static unsigned long reclaim_pages(struct list_head *folio_list)
+#else
+static unsigned long demote_pages(struct list_head *folio_list)
+#endif
+{
+	int nid;
+	unsigned int nr_reclaimed = 0;
+	LIST_HEAD(node_folio_list);
+	unsigned int noreclaim_flag;
+
+	if (list_empty(folio_list))
+		return nr_reclaimed;
+
+	noreclaim_flag = memalloc_noreclaim_save();
+
+	nid = folio_nid(lru_to_folio(folio_list));
+	do {
+		struct folio *folio = lru_to_folio(folio_list);
+
+		if (nid == folio_nid(folio)) {
+			folio_clear_active(folio);
+			list_move(&folio->lru, &node_folio_list);
+			continue;
+		}
+
+		nr_reclaimed += demote_folio_list2(&node_folio_list, NODE_DATA(nid));
+		nid = folio_nid(lru_to_folio(folio_list));
+	} while (!list_empty(folio_list));
+
+	nr_reclaimed += demote_folio_list2(&node_folio_list, NODE_DATA(nid));
+
+	memalloc_noreclaim_restore(noreclaim_flag);
+
+	return nr_reclaimed;
+}
+
+static unsigned long damon_pa_demote(struct damon_region *r, struct damos *s)
+{
+	unsigned long addr, applied;
+	LIST_HEAD(folio_list);
+
+	for (addr = r->ar.start; addr < r->ar.end; addr += PAGE_SIZE) {
+		struct folio *folio = damon_get_folio(PHYS_PFN(addr));
+
+		if (!folio)
+			continue;
+
+		if (damos_pa_filter_out(s, folio))
+			goto put_folio;
+
+		folio_clear_referenced(folio);
+		folio_test_clear_young(folio);
+		if (!folio_isolate_lru(folio))
+			goto put_folio;
+#if 0
+		if (folio_test_unevictable(folio))
+			folio_putback_lru(folio);
+		else
+#endif
+			list_add(&folio->lru, &folio_list);
+put_folio:
+		folio_put(folio);
+	}
+#if 0
+	applied = reclaim_pages(&folio_list);
+#else
+	applied = demote_pages(&folio_list);
+#endif
+	cond_resched();
+	return applied * PAGE_SIZE;
+}
+#endif
+
 static unsigned long damon_pa_pageout(struct damon_region *r, struct damos *s)
 {
 	unsigned long addr, applied;
@@ -303,6 +544,8 @@ static unsigned long damon_pa_apply_scheme(struct damon_ctx *ctx,
 		return damon_pa_mark_accessed(r, scheme);
 	case DAMOS_LRU_DEPRIO:
 		return damon_pa_deactivate_pages(r, scheme);
+	case DAMOS_DEMOTE:
+		return damon_pa_demote(r, scheme);
 	case DAMOS_STAT:
 		break;
 	default:
@@ -322,6 +565,8 @@ static int damon_pa_scheme_score(struct damon_ctx *context,
 	case DAMOS_LRU_PRIO:
 		return damon_hot_score(context, r, scheme);
 	case DAMOS_LRU_DEPRIO:
+		return damon_cold_score(context, r, scheme);
+	case DAMOS_DEMOTE:
 		return damon_cold_score(context, r, scheme);
 	default:
 		break;
