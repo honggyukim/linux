@@ -117,6 +117,7 @@
 #include <asm/tlb.h>
 #include <linux/uaccess.h>
 #include <linux/memory.h>
+#include <linux/topology.h>
 
 #include "internal.h"
 
@@ -2132,6 +2133,70 @@ bool apply_policy_zone(struct mempolicy *policy, enum zone_type zone)
 		dynamic_policy_zone = ZONE_MOVABLE;
 
 	return zone >= dynamic_policy_zone;
+}
+
+/*
+ * wi_get_socket_nodemask - Return all NUMA nodes sharing the same CPU socket
+ * as @nid, resolved via CPU topology and NUMA distance.
+ *
+ * For CPU nodes, the socket is determined directly from
+ * topology_physical_package_id(). For memory-only nodes (e.g. CXL/HBM that
+ * have no CPUs), the nearest CPU node is found via NUMA distance and used as
+ * a proxy to identify the owning socket. All nodes — both CPU and memory-only
+ * — whose nearest CPU node belongs to that socket are included in the result.
+ *
+ * Returns NODE_MASK_NONE if the socket cannot be determined.
+ */
+static nodemask_t wi_get_socket_nodemask(int nid)
+{
+	nodemask_t result = NODE_MASK_NONE;
+	nodemask_t cpu_nodes = node_states[N_CPU];
+	int pkg_id = -1, cpu, n, initiator;
+
+	/*
+	 * Resolve the initiator: for CPU nodes use @nid directly; for
+	 * memory-only nodes find the nearest CPU node via NUMA distance.
+	 */
+	if (node_state(nid, N_CPU)) {
+		initiator = nid;
+	} else {
+		initiator = nearest_node_nodemask(nid, &cpu_nodes);
+		if (initiator == NUMA_NO_NODE)
+			return result;
+	}
+
+	for_each_cpu(cpu, cpumask_of_node(initiator)) {
+		pkg_id = topology_physical_package_id(cpu);
+		break;
+	}
+	if (pkg_id < 0)
+		return result;
+
+	for_each_online_node(n) {
+		int nearest, c;
+
+		if (node_state(n, N_CPU)) {
+			/* CPU node: match package ID directly */
+			for_each_cpu(c, cpumask_of_node(n)) {
+				if (topology_physical_package_id(c) == pkg_id) {
+					node_set(n, result);
+					break;
+				}
+			}
+		} else {
+			/* Memory-only node: use nearest CPU node as socket proxy */
+			nearest = nearest_node_nodemask(n, &cpu_nodes);
+			if (nearest == NUMA_NO_NODE)
+				continue;
+			for_each_cpu(c, cpumask_of_node(nearest)) {
+				if (topology_physical_package_id(c) == pkg_id) {
+					node_set(n, result);
+					break;
+				}
+			}
+		}
+	}
+	return result;
 }
 
 static unsigned int weighted_interleave_nodes(struct mempolicy *policy)
