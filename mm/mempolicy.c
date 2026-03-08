@@ -2240,13 +2240,18 @@ static unsigned int weighted_interleave_nodes(struct mempolicy *policy)
 {
 	unsigned int node;
 	unsigned int cpuset_mems_cookie;
+	nodemask_t mask;
 
 retry:
 	/* to prevent miscount use tsk->mems_allowed_seq to detect rebind */
 	cpuset_mems_cookie = read_mems_allowed_begin();
 	node = current->il_prev;
-	if (!current->il_weight || !node_isset(node, policy->nodes)) {
-		node = next_node_in(node, policy->nodes);
+
+	if (policy_resolve_package_nodes(policy, &mask))
+		mask = policy->nodes;
+
+	if (!current->il_weight || !node_isset(node, mask)) {
+		node = next_node_in(node, mask);
 		if (read_mems_allowed_retry(cpuset_mems_cookie))
 			goto retry;
 		if (node == MAX_NUMNODES)
@@ -2364,7 +2369,7 @@ static unsigned int weighted_interleave_nid(struct mempolicy *pol, pgoff_t ilx)
 	u8 weight;
 	int nid = 0;
 
-	nr_nodes = read_once_policy_nodemask(pol, &nodemask);
+	nr_nodes = read_once_policy_package_nodemask(pol, &nodemask);
 	if (!nr_nodes)
 		return numa_node_id();
 
@@ -2808,7 +2813,7 @@ static unsigned long alloc_pages_bulk_weighted_interleave(gfp_t gfp,
 	/* read the nodes onto the stack, retry if done during rebind */
 	do {
 		cpuset_mems_cookie = read_mems_allowed_begin();
-		nnodes = read_once_policy_nodemask(pol, &nodes);
+		nnodes = read_once_policy_package_nodemask(pol, &nodes);
 	} while (read_mems_allowed_retry(cpuset_mems_cookie));
 
 	/* if the nodemask has become invalid, we cannot do anything */
