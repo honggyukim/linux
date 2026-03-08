@@ -11,6 +11,7 @@
 #include <linux/sort.h>
 #include <linux/idr.h>
 #include <linux/memory-tiers.h>
+#include <linux/mempolicy.h>
 #include <linux/string_choices.h>
 #include <cxlmem.h>
 #include <cxl.h>
@@ -2570,6 +2571,42 @@ static int cxl_region_calculate_adistance(struct notifier_block *nb,
 	return NOTIFY_STOP;
 }
 
+static int cxl_region_find_nearest_node(struct cxl_region *cxlr)
+{
+	struct cxl_region_params *p = &cxlr->params;
+	struct cxl_endpoint_decoder *cxled;
+	struct cxl_memdev *cxlmd;
+	int i, numa_node;
+
+	for (i = 0; i < p->nr_targets; i++) {
+		cxled = p->targets[i];
+		cxlmd = cxled_to_memdev(cxled);
+		numa_node = dev_to_node(&cxlmd->dev);
+		if (numa_node != NUMA_NO_NODE)
+			return numa_node;
+	}
+	return NUMA_NO_NODE;
+}
+
+static int cxl_region_register_wi_initiator(struct notifier_block *nb,
+					    unsigned long dax_nid, void *data)
+{
+	struct cxl_region *cxlr = container_of(nb, struct cxl_region,
+					       wi_notifier);
+	int region_nid, nearest_nid;
+
+	region_nid = phys_to_target_node(cxlr->params.res->start);
+	if (region_nid != (int)dax_nid)
+		return NOTIFY_DONE;
+
+	nearest_nid = cxl_region_find_nearest_node(cxlr);
+	if (nearest_nid == NUMA_NO_NODE)
+		return NOTIFY_DONE;
+
+	wi_register_node_initiator(dax_nid, nearest_nid);
+	return NOTIFY_OK;
+}
+
 /**
  * devm_cxl_add_region - Adds a region to a decoder
  * @cxlrd: root decoder
@@ -3788,6 +3825,7 @@ static void shutdown_notifiers(void *_cxlr)
 
 	unregister_node_notifier(&cxlr->node_notifier);
 	unregister_mt_adistance_algorithm(&cxlr->adist_notifier);
+	wi_unregister_node_notifier(&cxlr->wi_notifier);
 }
 
 static void remove_debugfs(void *dentry)
@@ -3939,6 +3977,10 @@ static int cxl_region_probe(struct device *dev)
 	cxlr->adist_notifier.notifier_call = cxl_region_calculate_adistance;
 	cxlr->adist_notifier.priority = 100;
 	register_mt_adistance_algorithm(&cxlr->adist_notifier);
+
+	cxlr->wi_notifier.notifier_call = cxl_region_register_wi_initiator;
+	cxlr->wi_notifier.priority = 100;
+	wi_register_node_notifier(&cxlr->wi_notifier);
 
 	rc = devm_add_action_or_reset(&cxlr->dev, shutdown_notifiers, cxlr);
 	if (rc)

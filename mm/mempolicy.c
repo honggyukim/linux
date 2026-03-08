@@ -118,6 +118,7 @@
 #include <linux/uaccess.h>
 #include <linux/memory.h>
 #include <linux/topology.h>
+#include <linux/notifier.h>
 
 #include "internal.h"
 
@@ -2136,15 +2137,99 @@ bool apply_policy_zone(struct mempolicy *policy, enum zone_type zone)
 }
 
 /*
+ * Per-node socket initiator table for weighted interleave.
+ *
+ * Drivers that know the exact PCIe/CXL attachment topology (e.g. the CXL
+ * driver) can register an initiator CPU node for a memory-only NUMA node via
+ * wi_register_node_initiator(). wi_get_socket_nodemask() checks this table
+ * first and falls back to NUMA distance only when no registration exists.
+ *
+ * This gives CXL-aware systems accurate socket grouping while remaining
+ * correct on systems without driver registration.
+ */
+static int wi_node_initiator[MAX_NUMNODES];
+
+static int __init wi_node_initiator_init(void)
+{
+	memset(wi_node_initiator, NUMA_NO_NODE, sizeof(wi_node_initiator));
+	return 0;
+}
+early_initcall(wi_node_initiator_init);
+
+static BLOCKING_NOTIFIER_HEAD(wi_node_notifiers);
+
+/**
+ * wi_register_node_notifier - Register a callback for memory-only node events
+ * @nb: notifier block; called with the new node's nid as the action value
+ *
+ * Drivers register here to be notified when a memory-only NUMA node comes
+ * online (triggered by wi_probe_node_initiator()). The callback should call
+ * wi_register_node_initiator() to record the socket initiator for that node.
+ */
+int wi_register_node_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&wi_node_notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(wi_register_node_notifier);
+
+/**
+ * wi_unregister_node_notifier - Unregister a previously registered notifier
+ * @nb: notifier block to remove
+ */
+void wi_unregister_node_notifier(struct notifier_block *nb)
+{
+	blocking_notifier_chain_unregister(&wi_node_notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(wi_unregister_node_notifier);
+
+/**
+ * wi_probe_node_initiator - Trigger initiator registration for a node
+ * @nid: the NUMA node that has just come online
+ *
+ * Called by DAX/KMEM when a memory-only node is added. Fires the notifier
+ * chain so that registered drivers (e.g. CXL) can call
+ * wi_register_node_initiator() with the correct initiator for @nid.
+ */
+void wi_probe_node_initiator(int nid)
+{
+	blocking_notifier_call_chain(&wi_node_notifiers, nid, NULL);
+}
+EXPORT_SYMBOL_GPL(wi_probe_node_initiator);
+
+/**
+ * wi_register_node_initiator - Set the socket initiator for a memory-only node
+ * @nid:          memory-only NUMA node (e.g. a CXL device node)
+ * @initiator_nid: CPU node that serves as the socket proxy for @nid
+ *
+ * Called by drivers (e.g. the CXL region driver) that know the exact
+ * host-side attachment point of a memory device. Once registered,
+ * wi_get_socket_nodemask() uses @initiator_nid to place @nid in the correct
+ * socket group instead of relying on NUMA distance.
+ */
+void wi_register_node_initiator(int nid, int initiator_nid)
+{
+	if (nid < 0 || nid >= MAX_NUMNODES)
+		return;
+	if (initiator_nid < 0 || initiator_nid >= MAX_NUMNODES)
+		return;
+	WRITE_ONCE(wi_node_initiator[nid], initiator_nid);
+}
+EXPORT_SYMBOL_GPL(wi_register_node_initiator);
+
+/*
  * wi_get_socket_nodemask - Return all NUMA nodes sharing the same CPU socket
- * as @nid, resolved via CPU topology and NUMA distance.
+ * as @nid, using a two-tier resolution strategy:
  *
- * For CPU nodes, the socket is determined directly from
- * topology_physical_package_id(). For memory-only nodes (e.g. CXL/HBM that
- * have no CPUs), the nearest CPU node is found via NUMA distance and used as
- * a proxy to identify the owning socket. All nodes — both CPU and memory-only
- * — whose nearest CPU node belongs to that socket are included in the result.
+ *  1. Driver registration (wi_node_initiator[]): if a driver has registered
+ *     an initiator CPU node for a memory-only node (e.g. via the CXL region
+ *     driver), that initiator is used directly. This reflects the actual
+ *     PCIe/CXL attachment topology and is the most accurate source.
  *
+ *  2. NUMA distance fallback: when no registration exists, the nearest CPU
+ *     node via node_distance() is used as a proxy. This works for most
+ *     systems but may be imprecise if firmware SLIT tables are inaccurate.
+ *
+ * CPU nodes always use topology_physical_package_id() directly.
  * Returns NODE_MASK_NONE if the socket cannot be determined.
  */
 static nodemask_t wi_get_socket_nodemask(int nid)
@@ -2153,14 +2238,16 @@ static nodemask_t wi_get_socket_nodemask(int nid)
 	nodemask_t cpu_nodes = node_states[N_CPU];
 	int pkg_id = -1, cpu, n, initiator;
 
-	/*
-	 * Resolve the initiator: for CPU nodes use @nid directly; for
-	 * memory-only nodes find the nearest CPU node via NUMA distance.
-	 */
 	if (node_state(nid, N_CPU)) {
 		initiator = nid;
 	} else {
-		initiator = nearest_node_nodemask(nid, &cpu_nodes);
+		/*
+		 * Prefer driver-registered initiator (accurate PCIe topology)
+		 * over NUMA distance (firmware approximation).
+		 */
+		initiator = READ_ONCE(wi_node_initiator[nid]);
+		if (initiator == NUMA_NO_NODE)
+			initiator = nearest_node_nodemask(nid, &cpu_nodes);
 		if (initiator == NUMA_NO_NODE)
 			return result;
 	}
@@ -2173,10 +2260,10 @@ static nodemask_t wi_get_socket_nodemask(int nid)
 		return result;
 
 	for_each_online_node(n) {
-		int nearest, c;
+		int proxy, c;
 
 		if (node_state(n, N_CPU)) {
-			/* CPU node: match package ID directly */
+			/* CPU node: match package ID directly from topology */
 			for_each_cpu(c, cpumask_of_node(n)) {
 				if (topology_physical_package_id(c) == pkg_id) {
 					node_set(n, result);
@@ -2184,11 +2271,13 @@ static nodemask_t wi_get_socket_nodemask(int nid)
 				}
 			}
 		} else {
-			/* Memory-only node: use nearest CPU node as socket proxy */
-			nearest = nearest_node_nodemask(n, &cpu_nodes);
-			if (nearest == NUMA_NO_NODE)
+			/* Memory-only node: driver registration takes priority */
+			proxy = READ_ONCE(wi_node_initiator[n]);
+			if (proxy == NUMA_NO_NODE)
+				proxy = nearest_node_nodemask(n, &cpu_nodes);
+			if (proxy == NUMA_NO_NODE)
 				continue;
-			for_each_cpu(c, cpumask_of_node(nearest)) {
+			for_each_cpu(c, cpumask_of_node(proxy)) {
 				if (topology_physical_package_id(c) == pkg_id) {
 					node_set(n, result);
 					break;

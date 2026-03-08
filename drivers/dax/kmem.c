@@ -12,6 +12,7 @@
 #include <linux/mman.h>
 #include <linux/memory-tiers.h>
 #include <linux/memory_hotplug.h>
+#include <linux/mempolicy.h>
 #include <linux/string_helpers.h>
 #include "dax-private.h"
 #include "bus.h"
@@ -93,6 +94,8 @@ static int dev_dax_kmem_probe(struct dev_dax *dev_dax)
 	mtype = kmem_find_alloc_memory_type(adist);
 	if (IS_ERR(mtype))
 		return PTR_ERR(mtype);
+
+	wi_probe_node_initiator(numa_node);
 
 	for (i = 0; i < dev_dax->nr_range; i++) {
 		struct range range;
