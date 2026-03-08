@@ -182,6 +182,11 @@ extern bool apply_policy_zone(struct mempolicy *policy, enum zone_type zone);
 extern int mempolicy_set_node_perf(unsigned int node,
 				   struct access_coordinate *coords);
 
+int wi_register_node_notifier(struct notifier_block *nb);
+void wi_unregister_node_notifier(struct notifier_block *nb);
+void wi_probe_node_initiator(int nid);
+void wi_register_node_initiator(int nid, int initiator_nid);
+
 #else
 
 struct mempolicy {};
@@ -301,6 +306,14 @@ static inline bool mpol_is_preferred_many(struct mempolicy *pol)
 {
 	return  false;
 }
+
+static inline int wi_register_node_notifier(struct notifier_block *nb)
+{
+	return 0;
+}
+static inline void wi_unregister_node_notifier(struct notifier_block *nb) {}
+static inline void wi_probe_node_initiator(int nid) {}
+static inline void wi_register_node_initiator(int nid, int initiator_nid) {}
 
 #endif /* CONFIG_NUMA */
 #endif

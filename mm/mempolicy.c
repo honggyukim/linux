@@ -118,6 +118,7 @@
 #include <linux/uaccess.h>
 #include <linux/memory.h>
 #include <linux/topology.h>
+#include <linux/notifier.h>
 
 #include "internal.h"
 
@@ -2134,6 +2135,86 @@ bool apply_policy_zone(struct mempolicy *policy, enum zone_type zone)
 
 	return zone >= dynamic_policy_zone;
 }
+
+/*
+ * Per-node socket initiator table for weighted interleave.
+ *
+ * Drivers that know the exact PCIe/CXL attachment topology (e.g. the CXL
+ * driver) can register an initiator CPU node for a memory-only NUMA node via
+ * wi_register_node_initiator(). wi_get_socket_nodemask() checks this table
+ * first and falls back to NUMA distance only when no registration exists.
+ *
+ * This gives CXL-aware systems accurate socket grouping while remaining
+ * correct on systems without driver registration.
+ */
+static int wi_node_initiator[MAX_NUMNODES];
+
+static int __init wi_node_initiator_init(void)
+{
+	memset(wi_node_initiator, NUMA_NO_NODE, sizeof(wi_node_initiator));
+	return 0;
+}
+early_initcall(wi_node_initiator_init);
+
+static BLOCKING_NOTIFIER_HEAD(wi_node_notifiers);
+
+/**
+ * wi_register_node_notifier - Register a callback for memory-only node events
+ * @nb: notifier block; called with the new node's nid as the action value
+ *
+ * Drivers register here to be notified when a memory-only NUMA node comes
+ * online (triggered by wi_probe_node_initiator()). The callback should call
+ * wi_register_node_initiator() to record the socket initiator for that node.
+ */
+int wi_register_node_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&wi_node_notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(wi_register_node_notifier);
+
+/**
+ * wi_unregister_node_notifier - Unregister a previously registered notifier
+ * @nb: notifier block to remove
+ */
+void wi_unregister_node_notifier(struct notifier_block *nb)
+{
+	blocking_notifier_chain_unregister(&wi_node_notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(wi_unregister_node_notifier);
+
+/**
+ * wi_probe_node_initiator - Trigger initiator registration for a node
+ * @nid: the NUMA node that has just come online
+ *
+ * Called by DAX/KMEM when a memory-only node is added. Fires the notifier
+ * chain so that registered drivers (e.g. CXL) can call
+ * wi_register_node_initiator() with the correct initiator for @nid.
+ */
+void wi_probe_node_initiator(int nid)
+{
+	blocking_notifier_call_chain(&wi_node_notifiers, nid, NULL);
+}
+EXPORT_SYMBOL_GPL(wi_probe_node_initiator);
+
+/**
+ * wi_register_node_initiator - Set the socket initiator for a memory-only node
+ * @nid:          memory-only NUMA node (e.g. a CXL device node)
+ * @initiator_nid: CPU node that serves as the socket proxy for @nid
+ *
+ * Called by drivers (e.g. the CXL region driver) that know the exact
+ * host-side attachment point of a memory device. Once registered,
+ * wi_get_socket_nodemask() uses @initiator_nid to place @nid in the correct
+ * socket group instead of relying on NUMA distance.
+ */
+void wi_register_node_initiator(int nid, int initiator_nid)
+{
+	if (nid < 0 || nid >= MAX_NUMNODES)
+		return;
+	if (initiator_nid < 0 || initiator_nid >= MAX_NUMNODES)
+		return;
+	WRITE_ONCE(wi_node_initiator[nid], initiator_nid);
+}
+EXPORT_SYMBOL_GPL(wi_register_node_initiator);
 
 /*
  * wi_get_socket_nodemask - Return all NUMA nodes sharing the same CPU socket
