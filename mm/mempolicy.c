@@ -2217,60 +2217,61 @@ void wi_register_node_initiator(int nid, int initiator_nid)
 EXPORT_SYMBOL_GPL(wi_register_node_initiator);
 
 /*
+ * wi_node_pkg_id - Return the physical package ID of the socket owning @nid.
+ *
+ * For CPU nodes the package ID is read directly. For memory-only nodes the
+ * nearest CPU node is resolved first (driver registration preferred over NUMA
+ * distance) and its package ID is returned. Returns -1 if the socket cannot
+ * be determined.
+ */
+static int wi_node_pkg_id(int nid, const nodemask_t *cpu_nodes)
+{
+	int nearest, cpu;
+
+	if (!node_state(nid, N_CPU)) {
+		nearest = READ_ONCE(wi_node_initiator[nid]);
+		if (nearest == NUMA_NO_NODE)
+			nearest = nearest_node_nodemask(nid, cpu_nodes);
+		if (nearest == NUMA_NO_NODE)
+			return -1;
+		nid = nearest;
+	}
+
+	cpu = cpumask_any(cpumask_of_node(nid));
+	if (cpu >= nr_cpu_ids)
+		return -1;
+	return topology_physical_package_id(cpu);
+}
+
+/*
  * wi_get_socket_nodemask - Return all NUMA nodes sharing the same CPU socket
- * as @nid, resolved via CPU topology and NUMA distance.
+ * as @nid, using a two-tier resolution strategy:
  *
- * For CPU nodes, the socket is determined directly from
- * topology_physical_package_id(). For memory-only nodes (e.g. CXL/HBM that
- * have no CPUs), the nearest CPU node is found via NUMA distance and used as
- * a proxy to identify the owning socket. All nodes — both CPU and memory-only
- * — whose nearest CPU node belongs to that socket are included in the result.
+ *  1. Driver registration (wi_node_initiator[]): if a driver has registered
+ *     an initiator CPU node for a memory-only node (e.g. via the CXL region
+ *     driver), that initiator is used directly. This reflects the actual
+ *     PCIe/CXL attachment topology and is the most accurate source.
  *
+ *  2. NUMA distance fallback: when no registration exists, the nearest CPU
+ *     node via node_distance() is used as a proxy. This works for most
+ *     systems but may be imprecise if firmware SLIT tables are inaccurate.
+ *
+ * CPU nodes always use topology_physical_package_id() directly.
  * Returns NODE_MASK_NONE if the socket cannot be determined.
  */
 static nodemask_t wi_get_socket_nodemask(int nid)
 {
 	nodemask_t result = NODE_MASK_NONE;
 	nodemask_t cpu_nodes = node_states[N_CPU];
-	int pkg_id = -1, cpu, n, initiator;
+	int pkg_id, n;
 
-	/*
-	 * Resolve the initiator: for CPU nodes use @nid directly; for
-	 * memory-only nodes find the nearest CPU node via NUMA distance.
-	 */
-	if (node_state(nid, N_CPU)) {
-		initiator = nid;
-	} else {
-		initiator = nearest_node_nodemask(nid, &cpu_nodes);
-		if (initiator == NUMA_NO_NODE)
-			return result;
-	}
-
-	cpu = cpumask_any(cpumask_of_node(initiator));
-	if (cpu < nr_cpu_ids)
-		pkg_id = topology_physical_package_id(cpu);
+	pkg_id = wi_node_pkg_id(nid, &cpu_nodes);
 	if (pkg_id < 0)
 		return result;
 
 	for_each_online_node(n) {
-		int nearest, c;
-
-		if (node_state(n, N_CPU)) {
-			/* CPU node: match package ID directly */
-			c = cpumask_any(cpumask_of_node(n));
-			if (c < nr_cpu_ids &&
-			    topology_physical_package_id(c) == pkg_id)
-				node_set(n, result);
-		} else {
-			/* Memory-only node: use nearest CPU node as socket proxy */
-			nearest = nearest_node_nodemask(n, &cpu_nodes);
-			if (nearest == NUMA_NO_NODE)
-				continue;
-			c = cpumask_any(cpumask_of_node(nearest));
-			if (c < nr_cpu_ids &&
-			    topology_physical_package_id(c) == pkg_id)
-				node_set(n, result);
-		}
+		if (wi_node_pkg_id(n, &cpu_nodes) == pkg_id)
+			node_set(n, result);
 	}
 	return result;
 }
