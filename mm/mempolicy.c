@@ -2194,6 +2194,48 @@ static nodemask_t wi_get_socket_nodemask(int nid)
 	return result;
 }
 
+/**
+ * policy_resolve_package_nodes - Restrict policy nodes to the current socket
+ * @policy: mempolicy whose candidate nodes are in @policy->nodes
+ * @mask:   output nodemask; on success, policy->nodes limited to the socket
+ *
+ * Intersects the current CPU's socket nodemask with @policy->nodes. If the
+ * intersection is empty (user excluded every node of the current socket),
+ * falls back to the socket of the first node in @policy->nodes. Returns
+ * -EINVAL if inputs are NULL or the socket cannot be resolved, -ENOENT if
+ * both intersection attempts yield an empty set.
+ */
+static int policy_resolve_package_nodes(struct mempolicy *policy, nodemask_t *mask)
+{
+	nodemask_t socket_mask;
+	int node;
+
+	if (!policy || !mask)
+		return -EINVAL;
+
+	nodes_clear(*mask);
+
+	socket_mask = wi_get_socket_nodemask(numa_node_id());
+	if (nodes_empty(socket_mask))
+		return -EINVAL;
+
+	nodes_and(*mask, socket_mask, policy->nodes);
+	if (!nodes_empty(*mask))
+		return 0;
+
+	/* Current socket has no allowed nodes; try the first policy node's socket */
+	node = first_node(policy->nodes);
+	socket_mask = wi_get_socket_nodemask(node);
+	if (nodes_empty(socket_mask))
+		return -EINVAL;
+
+	nodes_and(*mask, socket_mask, policy->nodes);
+	if (nodes_empty(*mask))
+		return -ENOENT;
+
+	return 0;
+}
+
 static unsigned int weighted_interleave_nodes(struct mempolicy *policy)
 {
 	unsigned int node;
@@ -2294,6 +2336,21 @@ static unsigned int read_once_policy_nodemask(struct mempolicy *pol,
 	barrier();
 	memcpy(mask, &pol->nodes, sizeof(nodemask_t));
 	barrier();
+	return nodes_weight(*mask);
+}
+
+static unsigned int read_once_policy_package_nodemask(struct mempolicy *pol,
+						      nodemask_t *mask)
+{
+	nodemask_t package_mask;
+
+	barrier();
+	if (policy_resolve_package_nodes(pol, &package_mask))
+		memcpy(mask, &pol->nodes, sizeof(nodemask_t));
+	else
+		memcpy(mask, &package_mask, sizeof(nodemask_t));
+	barrier();
+
 	return nodes_weight(*mask);
 }
 
